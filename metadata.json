@@ -1,0 +1,6 @@
+{
+  "name": "DocScan Pro",
+  "description": "Smart camera document scanner to PDF and multiple file formats with 15-day free trial and PayPal Pro subscription.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
