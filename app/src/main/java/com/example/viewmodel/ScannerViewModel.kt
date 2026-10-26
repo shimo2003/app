@@ -2,17 +2,20 @@ package com.example.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
-import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.billing.SubscriptionManager
 import com.example.data.DocumentRepository
+import com.example.data.SerialRepository
 import com.example.model.ExportFormat
 import com.example.model.ScanFilter
 import com.example.model.ScannedDocument
 import com.example.model.ScannedPage
+import com.example.model.SerialBatch
+import com.example.model.SerialItem
 import com.example.model.TrialState
 import com.example.util.DocumentProcessor
+import com.example.util.ExcelGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,7 +32,9 @@ enum class AppScreen {
     CAMERA_SCANNER,
     DOCUMENT_VIEWER,
     EXPORT_CONVERT,
-    SUBSCRIPTION
+    SUBSCRIPTION,
+    SERIAL_SCANNER,
+    SERIAL_EXCEL_VIEWER
 }
 
 sealed class ExportState {
@@ -42,15 +47,20 @@ sealed class ExportState {
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = DocumentRepository(application)
+    private val serialRepository = SerialRepository(application)
     val subscriptionManager = SubscriptionManager(application)
 
     private val _screen = MutableStateFlow(AppScreen.DASHBOARD)
     val screen: StateFlow<AppScreen> = _screen.asStateFlow()
 
     val documents: StateFlow<List<ScannedDocument>> = repository.documents
+    val serialBatches: StateFlow<List<SerialBatch>> = serialRepository.batches
 
     private val _activeDocument = MutableStateFlow<ScannedDocument?>(null)
     val activeDocument: StateFlow<ScannedDocument?> = _activeDocument.asStateFlow()
+
+    private val _activeSerialBatch = MutableStateFlow<SerialBatch?>(null)
+    val activeSerialBatch: StateFlow<SerialBatch?> = _activeSerialBatch.asStateFlow()
 
     private val _currentPageIndex = MutableStateFlow(0)
     val currentPageIndex: StateFlow<Int> = _currentPageIndex.asStateFlow()
@@ -70,8 +80,11 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val _exportState = MutableStateFlow<ExportState>(ExportState.Idle)
     val exportState: StateFlow<ExportState> = _exportState.asStateFlow()
 
-    private val _showPaywallDialog = MutableStateFlow(false)
-    val showPaywallDialog: StateFlow<Boolean> = _showPaywallDialog.asStateFlow()
+    private val _excelExportFile = MutableStateFlow<File?>(null)
+    val excelExportFile: StateFlow<File?> = _excelExportFile.asStateFlow()
+
+    private val _isExcelExporting = MutableStateFlow(false)
+    val isExcelExporting: StateFlow<Boolean> = _isExcelExporting.asStateFlow()
 
     fun refreshTrialState() {
         _trialState.value = subscriptionManager.getTrialState()
@@ -154,7 +167,6 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val page = doc.pages.getOrNull(_currentPageIndex.value) ?: return
 
         repository.updatePage(doc.id, page.id, page.rotationDegrees, filter)
-        // refresh active document
         val updatedPages = doc.pages.map {
             if (it.id == page.id) it.copy(filter = filter) else it
         }
@@ -235,6 +247,97 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // ==========================================
+    // Serial Scanner & Excel Spreadsheet Methods
+    // ==========================================
+
+    fun startNewSerialScan() {
+        val defaultBatch = _activeSerialBatch.value ?: serialBatches.value.firstOrNull() ?: run {
+            val newB = serialRepository.createBatch("Serial Inventory Scan - ${SimpleDateFormat("MMM dd", Locale.getDefault()).format(Date())}")
+            newB
+        }
+        _activeSerialBatch.value = defaultBatch
+        _screen.value = AppScreen.SERIAL_SCANNER
+    }
+
+    fun openSerialBatch(batch: SerialBatch) {
+        _activeSerialBatch.value = batch
+        _screen.value = AppScreen.SERIAL_EXCEL_VIEWER
+    }
+
+    fun createNewSerialBatch(title: String) {
+        val newBatch = serialRepository.createBatch(title)
+        _activeSerialBatch.value = newBatch
+        _screen.value = AppScreen.SERIAL_EXCEL_VIEWER
+    }
+
+    fun addScannedSerial(serialNumber: String, label: String = "Asset", category: String = "Hardware", notes: String = ""): Boolean {
+        val currentBatch = _activeSerialBatch.value ?: return false
+        val trimmed = serialNumber.trim()
+        if (trimmed.isEmpty()) return false
+
+        // Check for duplicate in this batch
+        val exists = currentBatch.items.any { it.serialNumber.equals(trimmed, ignoreCase = true) }
+
+        val newItem = SerialItem(
+            serialNumber = trimmed,
+            label = label,
+            category = category,
+            notes = notes,
+            status = if (exists) "Duplicate" else "Verified"
+        )
+
+        serialRepository.addSerialItem(currentBatch.id, newItem)
+        val updatedList = currentBatch.items + newItem
+        _activeSerialBatch.value = currentBatch.copy(items = updatedList)
+        return true
+    }
+
+    fun removeSerialItem(itemId: String) {
+        val currentBatch = _activeSerialBatch.value ?: return
+        serialRepository.removeSerialItem(currentBatch.id, itemId)
+        val updatedList = currentBatch.items.filter { it.id != itemId }
+        _activeSerialBatch.value = currentBatch.copy(items = updatedList)
+    }
+
+    fun deleteSerialBatch(batchId: String) {
+        serialRepository.deleteBatch(batchId)
+        if (_activeSerialBatch.value?.id == batchId) {
+            _activeSerialBatch.value = null
+            _screen.value = AppScreen.DASHBOARD
+        }
+    }
+
+    fun exportCurrentBatchToExcel(asXlsx: Boolean = true) {
+        val batch = _activeSerialBatch.value ?: return
+        _isExcelExporting.value = true
+        _excelExportFile.value = null
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val safeTitle = batch.title.replace(Regex("[^a-zA-Z0-9_\\-]"), "_").take(30)
+            val exportDir = File(getApplication<Application>().cacheDir, "excel_exports").apply { mkdirs() }
+            val ext = if (asXlsx) "xlsx" else "csv"
+            val targetFile = File(exportDir, "${safeTitle}.$ext")
+
+            val success = if (asXlsx) {
+                ExcelGenerator.exportToXlsx(batch, targetFile)
+            } else {
+                ExcelGenerator.exportToCsv(batch, targetFile)
+            }
+
+            withContext(Dispatchers.Main) {
+                _isExcelExporting.value = false
+                if (success && targetFile.exists()) {
+                    _excelExportFile.value = targetFile
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // Subscription & Pro Status Methods
+    // ==========================================
+
     fun unlockProWithCode(code: String): Boolean {
         val success = subscriptionManager.unlockPro(code)
         refreshTrialState()
@@ -249,13 +352,5 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun expireTrialForTesting() {
         subscriptionManager.expireTrialForTesting()
         refreshTrialState()
-    }
-
-    fun dismissPaywallDialog() {
-        _showPaywallDialog.value = false
-    }
-
-    fun showPaywall() {
-        _showPaywallDialog.value = true
     }
 }
